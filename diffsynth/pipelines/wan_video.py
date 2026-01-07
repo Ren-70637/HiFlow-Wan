@@ -12,6 +12,13 @@ from typing_extensions import Literal
 from transformers import Wav2Vec2Processor
 
 from ..diffusion import FlowMatchScheduler
+
+from diffsynth.diffusion.hiflow_utils import (
+    predict_x0_from_v, v_from_x0,
+    upsample_latents_bcthw, lowfreq_bcthw
+)
+from .hiflow_wan import _run_denoise_record_x0, _run_denoise_hiflow
+
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
@@ -175,6 +182,21 @@ class WanVideoPipeline(BasePipeline):
         # Prompt
         prompt: str,
         negative_prompt: Optional[str] = "",
+        # HiFlow-Video
+        use_hiflow: Optional[bool] = False,
+        target_height: int = 0,
+        target_width: int = 0,
+        hiflow_tau_ratio: float = 0.25,
+        hiflow_alpha: float = 0.6,
+        hiflow_beta: float = 0.4,
+        hiflow_lp_cutoff: float = 0.08,
+        hiflow_lp_order: int = 2,
+        # 文本平铺与训练基准尺寸（供长序列稳定与对齐）
+        text_duplication: bool = False,
+        train_latent_h: Optional[int] = None,
+        train_latent_w: Optional[int] = None,
+        train_seq_len: Optional[int] = None,
+        # hiflow_dump_dir: str = "",
         # Image-to-video
         input_image: Optional[Image.Image] = None,
         # First-last-frame-to-video
@@ -275,6 +297,11 @@ class WanVideoPipeline(BasePipeline):
             "input_audio": input_audio, "audio_sample_rate": audio_sample_rate, "s2v_pose_video": s2v_pose_video, "audio_embeds": audio_embeds, "s2v_pose_latents": s2v_pose_latents, "motion_video": motion_video,
             "animate_pose_video": animate_pose_video, "animate_face_video": animate_face_video, "animate_inpaint_video": animate_inpaint_video, "animate_mask_video": animate_mask_video,
             "vap_video": vap_video, 
+            # 文本平铺 / RoPE 对数缩放相关
+            "text_duplication": text_duplication,
+            "train_latent_h": train_latent_h,
+            "train_latent_w": train_latent_w,
+            "train_seq_len": train_seq_len,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -282,31 +309,97 @@ class WanVideoPipeline(BasePipeline):
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
-        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
-            # Switch DiT if necessary
-            if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and not models["dit"] is self.dit2:
-                self.load_models_to_device(self.in_iteration_models_2)
-                models["dit"] = self.dit2
-                models["vace"] = self.vace2
-                
-            # Timestep
-            timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            
-            # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
-            if cfg_scale != 1.0:
-                if cfg_merge:
-                    noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
-                else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
-                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
-            else:
-                noise_pred = noise_pred_posi
 
-            # Scheduler
-            inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-            if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+        use_hiflow = bool(inputs_shared.get("use_hiflow", False))  # 你也可以从函数参数拿
+        hiflow_low_height  = int(inputs_shared.get("hiflow_low_height", 0))
+        hiflow_low_width   = int(inputs_shared.get("hiflow_low_width", 0))
+        hiflow_tau_ratio   = float(inputs_shared.get("hiflow_tau_ratio", 0.2))
+        hiflow_alpha       = float(inputs_shared.get("hiflow_alpha", 0.6))
+        hiflow_beta        = float(inputs_shared.get("hiflow_beta", 0.4))
+        hiflow_lp_cutoff   = float(inputs_shared.get("hiflow_lp_cutoff", 0.08))
+        hiflow_lp_order    = int(inputs_shared.get("hiflow_lp_order", 2))
+
+        # high-res 的 height/width 就是你本次 pipeline 调用传进来的 height/width
+        # latent 尺寸严格按你工程：height // vae.upsampling_factor
+        if (not use_hiflow) or target_height <= 0 or target_width <= 0:
+            target_height, target_width = height, width
+            for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+                # Switch DiT if necessary
+                if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and not models["dit"] is self.dit2:
+                    self.load_models_to_device(self.in_iteration_models_2)
+                    models["dit"] = self.dit2
+                    models["vace"] = self.vace2
+                    
+                # Timestep
+                timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+                
+                # Inference
+                noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+                if cfg_scale != 1.0:
+                    if cfg_merge:
+                        noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
+                    else:
+                        noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                else:
+                    noise_pred = noise_pred_posi
+
+                # Scheduler
+                inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
+                if "first_frame_latents" in inputs_shared:
+                    inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+        else:
+            # ===== HiFlow 路径 =====
+            # # ===== 1) 准备 low-res latents，并跑 low-res 记录 x0_low_list =====
+            # # A) 计算 latent H/W 直接用管线里“从像素得到 latent 尺寸”的同一套逻辑）
+            # # 如果当前 wan_video.py 里已经算过 latent_h/latent_w，就复用那段代码。
+            up = self.vae.upsampling_factor
+
+            low_lat_h  = hiflow_low_height // up
+            low_lat_w  = hiflow_low_width  // up
+            high_lat_h = height // up
+            high_lat_w = width  // up
+            # 保险：避免 0 或负数
+            if low_lat_h <= 0 or low_lat_w <= 0 or high_lat_h <= 0 or high_lat_w <= 0:
+                use_hiflow = False
+
+            # --- Stage 1: low-res record x0 ---
+            low_inputs_shared = dict(inputs_shared)
+            # low_inputs_shared["latents"] 已经是 low-res（因为你 __call__ 传的 height/width 就是 480/720）
+            B, C, T = inputs_shared["latents"].shape[:3]
+            low_inputs_shared["latents"] = torch.randn(
+                (B, C, T, low_lat_h, low_lat_w),
+                device=self.device, dtype=self.torch_dtype
+            )
+
+            x0_low_list = _run_denoise_record_x0(
+                self, models,
+                low_inputs_shared, inputs_posi, inputs_nega,
+                cfg_scale=cfg_scale,
+                cfg_merge=cfg_merge,
+                switch_DiT_boundary=switch_DiT_boundary,
+                progress_bar_cmd=progress_bar_cmd,
+                store_on_cpu=True,
+            )
+
+            # --- Stage 2: high-res HiFlow ---
+            inputs_shared["latents"] = _run_denoise_hiflow(
+                self, models,
+                inputs_shared, inputs_posi, inputs_nega,
+                x0_low_list=x0_low_list,
+                high_latent_h=high_lat_h,
+                high_latent_w=high_lat_w,
+                tau_ratio=hiflow_tau_ratio,
+                cfg_scale=cfg_scale,
+                cfg_merge=cfg_merge,
+                switch_DiT_boundary=switch_DiT_boundary,
+                progress_bar_cmd=progress_bar_cmd,
+                alpha=hiflow_alpha,
+                beta=hiflow_beta,
+                lp_cutoff=hiflow_lp_cutoff,
+                lp_order=hiflow_lp_order,
+                train_seq_len=train_seq_len,
+            )
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
@@ -1118,9 +1211,17 @@ class TemporalTiler_BCTHW:
         return value
 
 
-
 def model_fn_wan_video(
     dit: WanModel,
+    # 新增 NTK 外推参数
+    ntk_factor_t: float = 1.0,
+    ntk_factor_h: float = 1.0,
+    ntk_factor_w: float = 1.0,
+    text_duplication: bool = False,
+    train_latent_h: int = None,
+    train_latent_w: int = None,
+    train_seq_len: int = None,
+
     motion_controller: WanMotionControllerModel = None,
     vace: VaceWanModel = None,
     vap: MotWanModel = None,
@@ -1171,6 +1272,14 @@ def model_fn_wan_video(
             tea_cache=tea_cache,
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
+            # 透传 NTK 与文本平铺/训练尺寸
+            ntk_factor_t=ntk_factor_t,
+            ntk_factor_h=ntk_factor_h,
+            ntk_factor_w=ntk_factor_w,
+            text_duplication=text_duplication,
+            train_latent_h=train_latent_h,
+            train_latent_w=train_latent_w,
+            train_seq_len=train_seq_len,
         )
         return TemporalTiler_BCTHW().run(
             model_fn_wan_video,
@@ -1259,6 +1368,12 @@ def model_fn_wan_video(
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+     # 文本平铺：基于训练时的 latent 网格尺寸
+    if text_duplication and train_latent_h and train_latent_w:
+        scale_h = max(1, h // train_latent_h)
+        scale_w = max(1, w // train_latent_w)
+        if scale_h > 1 or scale_w > 1:
+            context = context.repeat(1, scale_h * scale_w, 1)
     
     # Reference image
     if reference_latents is not None:
@@ -1268,11 +1383,25 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
+    if ntk_factor_t != 1.0 or ntk_factor_h != 1.0 or ntk_factor_w != 1.0:
+        max_end = max(f, h, w) + 64  # 预留余量
+        freqs_tuple = dit.get_freqs_with_ntk(
+            ntk_f=ntk_factor_t, ntk_h=ntk_factor_h, ntk_w=ntk_factor_w, end=max_end
+        )
+    else:
+        freqs_tuple = dit.freqs
+
     freqs = torch.cat([
+        freqs_tuple[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs_tuple[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs_tuple[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+    '''freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)'''
 
     # VAP 
     if vap is not None:
@@ -1349,17 +1478,17 @@ def model_fn_wan_video(
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, t_mod, freqs, train_seq_len,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs,
+                        x, context, t_mod, freqs, train_seq_len,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs)
+                    x = block(x, context, t_mod, freqs, train_seq_len=train_seq_len)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

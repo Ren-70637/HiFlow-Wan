@@ -24,7 +24,56 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     
     
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, train_seq_len: int = None):
+    if compatibility_mode:
+        scale = None
+        if train_seq_len is not None and train_seq_len > 0:
+            cur_seq_len = q.shape[2] if compatibility_mode else q.shape[1]
+            head_dim = q.shape[-1]
+            log_scale = math.log(cur_seq_len) / math.log(train_seq_len) if cur_seq_len > train_seq_len else 1.0
+            scale = math.sqrt(log_scale / head_dim)
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        # 关键：把 scale 传给 scaled_dot_product_attention
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale)
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    elif FLASH_ATTN_3_AVAILABLE:
+        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+        x = flash_attn_interface.flash_attn_func(q, k, v)
+        if isinstance(x,tuple):
+            x = x[0]
+        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    elif FLASH_ATTN_2_AVAILABLE:
+        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+        x = flash_attn.flash_attn_func(q, k, v)
+        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    elif SAGE_ATTN_AVAILABLE:
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        x = sageattn(q, k, v)
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    else:
+        scale = None
+        if train_seq_len is not None and train_seq_len > 0:
+            cur_seq_len = q.shape[1]
+            head_dim = q.shape[-1] // num_heads
+            log_scale = math.log(cur_seq_len) / math.log(train_seq_len) if cur_seq_len > train_seq_len else 1.0
+            scale = math.sqrt(log_scale / head_dim)
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale)
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+    return x
+
+'''def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -57,7 +106,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    return x
+    return x'''
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
@@ -71,12 +120,19 @@ def sinusoidal_embedding_1d(dim, position):
     return x.to(position.dtype)
 
 
-def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
+'''def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
     # 3d rope precompute
     f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)
     h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
     w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
-    return f_freqs_cis, h_freqs_cis, w_freqs_cis
+    return f_freqs_cis, h_freqs_cis, w_freqs_cis'''
+
+def precompute_freqs_cis_3d(dim, end=1024, theta=10000.0,
+                            ntk_f=1.0, ntk_h=1.0, ntk_w=1.0):
+    f = precompute_freqs_cis(dim - 2*(dim//3), end=end, theta=theta*ntk_f)
+    h = precompute_freqs_cis(dim//3, end=end, theta=theta*ntk_h)
+    w = precompute_freqs_cis(dim//3, end=end, theta=theta*ntk_w)
+    return f,h,w
 
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
@@ -115,8 +171,9 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         
-    def forward(self, q, k, v):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
+    def forward(self, q, k, v, train_seq_len=None):
+        # train_seq_len 用于对数缩放注意力温度，默认 None 时保持原始行为
+        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, train_seq_len=train_seq_len)
         return x
 
 
@@ -136,13 +193,13 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, train_seq_len=None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, train_seq_len=train_seq_len)
         return self.o(x)
 
 
@@ -210,7 +267,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, train_seq_len=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -222,7 +279,7 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, train_seq_len=train_seq_len))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -321,7 +378,9 @@ class WanModel(torch.nn.Module):
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
+        self.num_heads = num_heads  # 新增：保存 num_heads
         head_dim = dim // num_heads
+        self.head_dim = head_dim  # 新增：保存 head_dim
         self.freqs = precompute_freqs_cis_3d(head_dim)
 
         if has_image_input:
@@ -334,6 +393,14 @@ class WanModel(torch.nn.Module):
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
         else:
             self.control_adapter = None
+    
+    # 新增方法：按需重算 freqs
+    def get_freqs_with_ntk(self, ntk_f=1.0, ntk_h=1.0, ntk_w=1.0, end=1024):
+        """动态生成带 NTK 外推的 3D RoPE 频率表"""
+        return precompute_freqs_cis_3d(
+            self.head_dim, end=end,
+            ntk_f=ntk_f, ntk_h=ntk_h, ntk_w=ntk_w
+        )
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
@@ -358,6 +425,7 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                train_seq_len: Optional[int] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -389,17 +457,17 @@ class WanModel(torch.nn.Module):
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
-                            x, context, t_mod, freqs,
+                            x, context, t_mod, freqs, train_seq_len,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x, context, t_mod, freqs,
+                        x, context, t_mod, freqs, train_seq_len,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, train_seq_len=train_seq_len)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

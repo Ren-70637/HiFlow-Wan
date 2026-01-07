@@ -157,59 +157,59 @@ def _run_denoise_hiflow(
     v_prev: Optional[torch.Tensor] = None
     vref_prev: Optional[torch.Tensor] = None
 
-    # 从 tau_index 开始积分到末尾
-    # 注意：progress_bar_cmd 只用于显示；我们仍然按 progress_id 精确取 sigma/timestep
-    for progress_id in range(tau_index, N):
-        ts_cpu = pipe.scheduler.timesteps[progress_id]   # CPU tensor（step 用）
-        models = _maybe_switch_dit(pipe, models, ts_cpu, switch_DiT_boundary)
+    _sentinel = object()
+    prev_train_seq_len = inputs_shared.get("train_seq_len", _sentinel)
+    prev_ntk_h = inputs_shared.get("ntk_factor_h", _sentinel)
+    prev_ntk_w = inputs_shared.get("ntk_factor_w", _sentinel)
 
-        timestep = ts_cpu.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
-        
-        # 这里注入 ntk_factor，供 model_fn_wan_video 通过 **kwargs 取到
-        inputs_shared["ntk_factor_h"] = ntk_factor_h
-        inputs_shared["ntk_factor_w"] = ntk_factor_w
+    if train_seq_len is not None:
         inputs_shared["train_seq_len"] = train_seq_len
+    else:
+        inputs_shared.pop("train_seq_len", None)
 
-        v_model = _cfg_guided_v(pipe, models, inputs_shared, inputs_posi, inputs_nega, timestep, cfg_scale, cfg_merge)
+    inputs_shared["ntk_factor_h"] = ntk_factor_h
+    inputs_shared["ntk_factor_w"] = ntk_factor_w
 
-        # 当前 σ
-        sigma = pipe.scheduler.sigmas[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
-        sigma_view = sigma.view(1, 1, 1, 1, 1)
 
-        x = inputs_shared["latents"]
+    # 从 tau_index 开始积分到末尾
+    try:
+        for progress_id in range(tau_index, N):
+            ts_cpu = pipe.scheduler.timesteps[progress_id]
+            models = _maybe_switch_dit(pipe, models, ts_cpu, switch_DiT_boundary)
+            timestep = ts_cpu.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+            # 这里删掉每步写 inputs_shared 的三行
+            v_model = _cfg_guided_v(pipe, models, inputs_shared, inputs_posi, inputs_nega, timestep, cfg_scale, cfg_merge)
+            sigma = pipe.scheduler.sigmas[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
+            sigma_view = sigma.view(1, 1, 1, 1, 1)
+            x = inputs_shared["latents"]
+            x0_pred = predict_x0_from_v(x, v_model, sigma_view)
+            x0_low_i = x0_low_list[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
+            x0_ref = upsample_latents_bcthw(x0_low_i, high_latent_h, high_latent_w, mode=upsample_mode)
 
-        # 预测 x0_high
-        x0_pred = predict_x0_from_v(x, v_model, sigma_view)
+            lp_ref = lowfreq_bcthw(x0_ref, cutoff=lp_cutoff, order=lp_order)
+            lp_pred = lowfreq_bcthw(x0_pred, cutoff=lp_cutoff, order=lp_order)
+            x0_aligned = x0_pred + alpha * (lp_ref - lp_pred)
 
-        # reference x0_ref = phi(x0_low_pred[progress_id])
-        x0_low_i = x0_low_list[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
-        x0_ref = upsample_latents_bcthw(x0_low_i, high_latent_h, high_latent_w, mode=upsample_mode)
+            v = v_from_x0(x, x0_aligned, sigma_view)
 
-        # ---- Direction alignment（低频替换）----
-        # x0_aligned = x0_pred + alpha * (LP(x0_ref) - LP(x0_pred))
-        lp_ref = lowfreq_bcthw(x0_ref, cutoff=lp_cutoff, order=lp_order)
-        lp_pred = lowfreq_bcthw(x0_pred, cutoff=lp_cutoff, order=lp_order)
-        x0_aligned = x0_pred + alpha * (lp_ref - lp_pred)
+            v_ref = noise_high - x0_ref
+            if v_prev is not None and vref_prev is not None:
+                dv = v - v_prev
+                dv_ref = v_ref - vref_prev
+                v = v + beta * (dv_ref - dv)
 
-        # 转回 v（保持 scheduler 一致）
-        v = v_from_x0(x, x0_aligned, sigma_view)
+            v_prev = v
+            vref_prev = v_ref
 
-        # ---- Acceleration alignment（速度差分对齐）----
-        # 在你的 scheduler 定义下：v_ref = x1_high - x0_ref = noise_high - x0_ref
-        v_ref = noise_high - x0_ref
-
-        if v_prev is not None and vref_prev is not None:
-            dv = v - v_prev
-            dv_ref = v_ref - vref_prev
-            v = v + beta * (dv_ref - dv)
-
-        v_prev = v
-        vref_prev = v_ref
-
-        # scheduler step
-        inputs_shared["latents"] = pipe.scheduler.step(v, ts_cpu, x)
-
-        if "first_frame_latents" in inputs_shared:
-            inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
-
+            inputs_shared["latents"] = pipe.scheduler.step(v, ts_cpu, x)
+            if "first_frame_latents" in inputs_shared:
+                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+    finally:
+        for key, prev in (("train_seq_len", prev_train_seq_len),
+                        ("ntk_factor_h", prev_ntk_h),
+                        ("ntk_factor_w", prev_ntk_w)):
+            if prev is _sentinel:
+                inputs_shared.pop(key, None)
+            else:
+                inputs_shared[key] = prev
     return inputs_shared["latents"]

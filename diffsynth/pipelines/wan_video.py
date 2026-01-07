@@ -191,6 +191,10 @@ class WanVideoPipeline(BasePipeline):
         hiflow_beta: float = 0.4,
         hiflow_lp_cutoff: float = 0.08,
         hiflow_lp_order: int = 2,
+        hiflow_low_height: int = 0,
+        hiflow_low_width: int = 0,
+        ntk_factor_h: float = 1.0,
+        ntk_factor_w: float = 1.0,
         # 文本平铺与训练基准尺寸（供长序列稳定与对齐）
         text_duplication: bool = False,
         train_latent_h: Optional[int] = None,
@@ -302,6 +306,11 @@ class WanVideoPipeline(BasePipeline):
             "train_latent_h": train_latent_h,
             "train_latent_w": train_latent_w,
             "train_seq_len": train_seq_len,
+            "use_hiflow": use_hiflow,
+            "hiflow_low_height": hiflow_low_height,
+            "hiflow_low_width": hiflow_low_width,
+            "ntk_factor_h": ntk_factor_h,
+            "ntk_factor_w": ntk_factor_w,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -367,6 +376,13 @@ class WanVideoPipeline(BasePipeline):
             low_inputs_shared = dict(inputs_shared)
             # low_inputs_shared["latents"] 已经是 low-res（因为你 __call__ 传的 height/width 就是 480/720）
             B, C, T = inputs_shared["latents"].shape[:3]
+
+            pT, pH, pW = models["dit"].patch_size
+            f_token = T // pT
+            h_token = low_lat_h // pH
+            w_token = low_lat_w // pW
+            train_seq_len_base = f_token * h_token * w_token
+
             low_inputs_shared["latents"] = torch.randn(
                 (B, C, T, low_lat_h, low_lat_w),
                 device=self.device, dtype=self.torch_dtype
@@ -384,22 +400,25 @@ class WanVideoPipeline(BasePipeline):
 
             # --- Stage 2: high-res HiFlow ---
             inputs_shared["latents"] = _run_denoise_hiflow(
-                self, models,
-                inputs_shared, inputs_posi, inputs_nega,
-                x0_low_list=x0_low_list,
-                high_latent_h=high_lat_h,
-                high_latent_w=high_lat_w,
-                tau_ratio=hiflow_tau_ratio,
-                cfg_scale=cfg_scale,
-                cfg_merge=cfg_merge,
-                switch_DiT_boundary=switch_DiT_boundary,
-                progress_bar_cmd=progress_bar_cmd,
-                alpha=hiflow_alpha,
-                beta=hiflow_beta,
-                lp_cutoff=hiflow_lp_cutoff,
-                lp_order=hiflow_lp_order,
-                train_seq_len=train_seq_len,
-            )
+            self, models,
+            inputs_shared, inputs_posi, inputs_nega,
+            x0_low_list=x0_low_list,
+            high_latent_h=high_lat_h,
+            high_latent_w=high_lat_w,
+            tau_ratio=hiflow_tau_ratio,
+            cfg_scale=cfg_scale,
+            cfg_merge=cfg_merge,
+            switch_DiT_boundary=switch_DiT_boundary,
+            progress_bar_cmd=progress_bar_cmd,
+            alpha=hiflow_alpha,
+            beta=hiflow_beta,
+            lp_cutoff=hiflow_lp_cutoff,
+            lp_order=hiflow_lp_order,
+            train_seq_len=train_seq_len_base,
+            # 若需要可控 ntk，可加：
+            # ntk_factor_h=ntk_factor_h,
+            # ntk_factor_w=ntk_factor_w,
+        )
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
@@ -1383,19 +1402,36 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
-    if ntk_factor_t != 1.0 or ntk_factor_h != 1.0 or ntk_factor_w != 1.0:
-        max_end = max(f, h, w) + 64  # 预留余量
-        freqs_tuple = dit.get_freqs_with_ntk(
-            ntk_f=ntk_factor_t, ntk_h=ntk_factor_h, ntk_w=ntk_factor_w, end=max_end
-        )
-    else:
-        freqs_tuple = dit.freqs
+    # 缓存 dict：避免每步重算
+    cache = getattr(dit, "_ntk_freqs_cache", None)
+    if cache is None:
+        cache = {}
+        dit._ntk_freqs_cache = cache
 
-    freqs = torch.cat([
-        freqs_tuple[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        freqs_tuple[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        freqs_tuple[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    if ntk_factor_t != 1.0 or ntk_factor_h != 1.0 or ntk_factor_w != 1.0:
+        cache_key = (
+            f, h, w,
+            float(ntk_factor_t), float(ntk_factor_h), float(ntk_factor_w),
+            x.device.type, x.device.index
+        )
+        freqs = cache.get(cache_key)
+        if freqs is None:
+            max_end = max(f, h, w) + 64  # 预留余量
+            freqs_tuple = dit.get_freqs_with_ntk(
+                ntk_f=ntk_factor_t, ntk_h=ntk_factor_h, ntk_w=ntk_factor_w, end=max_end
+            )
+            freqs = torch.cat([
+                freqs_tuple[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs_tuple[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs_tuple[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+            cache[cache_key] = freqs
+    else:
+        freqs = torch.cat([
+            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     '''freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),

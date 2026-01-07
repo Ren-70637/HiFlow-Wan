@@ -28,14 +28,14 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     if compatibility_mode:
         scale = None
         if train_seq_len is not None and train_seq_len > 0:
-            cur_seq_len = q.shape[2] if compatibility_mode else q.shape[1]
-            head_dim = q.shape[-1]
+            # 修复：在 rearrange 之前，q 形状是 [B, seq_len, num_heads*head_dim]
+            cur_seq_len = q.shape[1]  # ← 修复：应该是 shape[1]，不是 shape[2]
+            head_dim = q.shape[-1] // num_heads  # ← 修复：需要除以 num_heads
             log_scale = math.log(cur_seq_len) / math.log(train_seq_len) if cur_seq_len > train_seq_len else 1.0
             scale = math.sqrt(log_scale / head_dim)
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        # 关键：把 scale 传给 scaled_dot_product_attention
         x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     elif FLASH_ATTN_3_AVAILABLE:

@@ -9,6 +9,16 @@ from ..diffusion.hiflow_utils import (
     lowfreq_bcthw,
 )
 
+from ..diffusion.dynamic_framerate_utils import (
+    parse_framerate_schedule,
+    apply_dynamic_framerate,
+    restore_temporal_full_frames,
+    resize_latents_spatial,
+    compute_stage_resolution,
+    get_current_stage,
+    should_switch_resolution,
+)
+
 # -------------------------
 # helpers: cfg + dit switch
 # -------------------------
@@ -173,9 +183,23 @@ def _run_denoise_hiflow(
     # profiling
     perf=None,
     profile_sample_every: int = 0,
+    # ========== Dynamic Frame Rate (NEW) ==========
+    enable_dynamic_framerate: bool = False,
+    framerate_schedule: Optional[str] = None,
+    framerate_interpolation_mode: str = "trilinear",
+    framerate_keep_boundary: bool = True,
+    # ========== Dynamic Resolution (NEW) ==========
+    enable_dynamic_res: bool = False,
+    res_rate_list: Optional[List[float]] = None,
+    res_step_list: Optional[List[int]] = None,
+    res_upsample_mode: str = "bilinear",
 ) -> torch.Tensor:
     """
     返回 high-res 最终 latents: [B,C,T,Hhigh,Whigh]
+    
+    New features:
+    - Dynamic Frame Rate: sparse temporal sampling during model forward
+    - Dynamic Resolution: progressive resolution scaling during Stage2
     """
     N = len(pipe.scheduler.timesteps)
     assert len(x0_low_list) == N, "x0_low_list length must match scheduler.timesteps"
@@ -184,21 +208,66 @@ def _run_denoise_hiflow(
     tau_ratio = float(max(0.0, min(0.999, tau_ratio)))
     tau_index = int(tau_ratio * N)
 
-    # 准备 high-res 噪声端 x1_high（HiFlow 里 reference flow 用到）
-    # 这里 batch/通道/帧数来自当前 inputs_shared["latents"] 的 B,C,T
+    # ========== Parse dynamic framerate schedule ==========
+    framerate_map = None
+    if enable_dynamic_framerate and framerate_schedule:
+        framerate_map = parse_framerate_schedule(framerate_schedule, N)
+    
+    # ========== Parse dynamic resolution config ==========
+    # Validate and default res config
+    if enable_dynamic_res:
+        if res_rate_list is None or res_step_list is None:
+            enable_dynamic_res = False
+            print("[HiFlow] Warning: enable_dynamic_res=True but res_rate_list or res_step_list is None. Disabled.")
+        elif len(res_rate_list) != len(res_step_list):
+            enable_dynamic_res = False
+            print("[HiFlow] Warning: res_rate_list and res_step_list length mismatch. Disabled.")
+        else:
+            # Ensure res_step_list is sorted
+            res_step_list = list(res_step_list)
+            res_rate_list = list(res_rate_list)
+            # Make sure first stage starts at 0
+            if res_step_list[0] != 0:
+                res_step_list = [0] + res_step_list
+                res_rate_list = [res_rate_list[0]] + res_rate_list
+
+    # Get patch size for resolution alignment
+    pT, pH, pW = models["dit"].patch_size if hasattr(models["dit"], "patch_size") else (1, 2, 2)
+
+    # ========== Prepare base noise (used for all stages) ==========
     B, C, T = inputs_shared["latents"].shape[:3]
-    noise_high = torch.randn((B, C, T, high_latent_h, high_latent_w), device=pipe.device, dtype=pipe.torch_dtype)
+    
+    # Compute initial resolution for Stage2
+    if enable_dynamic_res and res_rate_list:
+        initial_rate = res_rate_list[0]
+        current_h, current_w = compute_stage_resolution(
+            high_latent_h, high_latent_w, initial_rate, pH, pW
+        )
+    else:
+        current_h, current_w = high_latent_h, high_latent_w
+    
+    # Base noise at final resolution (will be resized for each stage)
+    noise_base = torch.randn((B, C, T, high_latent_h, high_latent_w), device=pipe.device, dtype=pipe.torch_dtype)
+    
+    # Get noise for current resolution
+    if current_h == high_latent_h and current_w == high_latent_w:
+        noise_current = noise_base
+    else:
+        noise_current = resize_latents_spatial(noise_base, current_h, current_w, mode=res_upsample_mode)
 
     # 取 tau 时刻的 x0_ref(tau) = phi(x0_low_pred[tau])
     x0_low_tau = x0_low_list[tau_index].to(device=pipe.device, dtype=pipe.torch_dtype)
-    x0_ref_tau = upsample_latents_bcthw(x0_low_tau, high_latent_h, high_latent_w, mode=upsample_mode)
+    x0_ref_tau = upsample_latents_bcthw(x0_low_tau, current_h, current_w, mode=upsample_mode)
 
-    # 初始化：x_high(σ_tau) = add_noise(x0_ref_tau, noise_high, timestep_tau)
+    # 初始化：x_high(σ_tau) = add_noise(x0_ref_tau, noise_current, timestep_tau)
     ts_tau = pipe.scheduler.timesteps[tau_index].to(device=pipe.device, dtype=pipe.torch_dtype)
-    inputs_shared["latents"] = pipe.scheduler.add_noise(x0_ref_tau, noise_high, ts_tau)
+    inputs_shared["latents"] = pipe.scheduler.add_noise(x0_ref_tau, noise_current, ts_tau)
 
     v_prev: Optional[torch.Tensor] = None
     vref_prev: Optional[torch.Tensor] = None
+    
+    # Track current stage for dynamic resolution
+    current_stage_idx = 0
 
     _sentinel = object()
     prev_train_seq_len = inputs_shared.get("train_seq_len", _sentinel)
@@ -213,7 +282,6 @@ def _run_denoise_hiflow(
     inputs_shared["ntk_factor_h"] = ntk_factor_h
     inputs_shared["ntk_factor_w"] = ntk_factor_w
 
-
     # 从 tau_index 开始积分到末尾
     try:
         for progress_id in range(tau_index, N):
@@ -222,14 +290,43 @@ def _run_denoise_hiflow(
             ts_cpu = pipe.scheduler.timesteps[progress_id]
             models = _maybe_switch_dit(pipe, models, ts_cpu, switch_DiT_boundary)
             timestep = ts_cpu.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
-            # 这里删掉每步写 inputs_shared 的三行
+            
+            # ========== Dynamic Frame Rate: sparse sampling before model forward ==========
+            frame_info = None
+            latents_full = inputs_shared["latents"]
+            
+            if framerate_map is not None:
+                latents_sparse, frame_info = apply_dynamic_framerate(
+                    latents_full, progress_id, framerate_map, keep_boundary=framerate_keep_boundary
+                )
+                if frame_info is not None:
+                    # Temporarily use sparse latents for model forward
+                    inputs_shared["latents"] = latents_sparse
+            
+            # Model forward
             v_model = _cfg_guided_v(pipe, models, inputs_shared, inputs_posi, inputs_nega, timestep, cfg_scale, cfg_merge)
+            
+            # ========== Dynamic Frame Rate: restore full frames after model forward ==========
+            if frame_info is not None:
+                # Restore latents to full
+                inputs_shared["latents"] = latents_full
+                # Restore v_model to full frames
+                v_model = restore_temporal_full_frames(
+                    v_model.unsqueeze(0) if v_model.dim() == 4 else v_model,
+                    frame_info,
+                    interpolation_mode=framerate_interpolation_mode
+                )
+                if v_model.dim() == 5 and v_model.shape[0] == 1:
+                    v_model = v_model  # Keep [B,C,T,H,W]
+            
             sigma = pipe.scheduler.sigmas[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
             sigma_view = sigma.view(1, 1, 1, 1, 1)
             x = inputs_shared["latents"]
             x0_pred = predict_x0_from_v(x, v_model, sigma_view)
+            
+            # Upsample x0_low to current resolution (may differ from final high_latent_h/w)
             x0_low_i = x0_low_list[progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
-            x0_ref = upsample_latents_bcthw(x0_low_i, high_latent_h, high_latent_w, mode=upsample_mode)
+            x0_ref = upsample_latents_bcthw(x0_low_i, current_h, current_w, mode=upsample_mode)
 
             lp_ref = lowfreq_bcthw(x0_ref, cutoff=lp_cutoff, order=lp_order)
             lp_pred = lowfreq_bcthw(x0_pred, cutoff=lp_cutoff, order=lp_order)
@@ -237,7 +334,8 @@ def _run_denoise_hiflow(
 
             v = v_from_x0(x, x0_aligned, sigma_view)
 
-            v_ref = noise_high - x0_ref
+            # Reference flow with current resolution noise
+            v_ref = noise_current - x0_ref
             if v_prev is not None and vref_prev is not None:
                 dv = v - v_prev
                 dv_ref = v_ref - vref_prev
@@ -249,7 +347,54 @@ def _run_denoise_hiflow(
             inputs_shared["latents"] = pipe.scheduler.step(v, ts_cpu, x)
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+            
+            # ========== Dynamic Resolution: check if we need to switch ==========
+            if enable_dynamic_res and res_step_list and progress_id < N - 1:
+                # Check next step
+                next_progress_id = progress_id + 1
+                relative_next = next_progress_id - tau_index
+                
+                # Find if we're at a resolution switch point
+                should_switch = False
+                next_stage = current_stage_idx
+                for i, step_threshold in enumerate(res_step_list):
+                    if relative_next == step_threshold and i > current_stage_idx:
+                        should_switch = True
+                        next_stage = i
+                        break
+                
+                if should_switch and next_stage < len(res_rate_list):
+                    # Compute new resolution
+                    new_rate = res_rate_list[next_stage]
+                    new_h, new_w = compute_stage_resolution(
+                        high_latent_h, high_latent_w, new_rate, pH, pW
+                    )
+                    
+                    if new_h != current_h or new_w != current_w:
+                        # Use x0_aligned as clean estimate for transition
+                        x0_switch = x0_aligned
+                        
+                        # Upsample to new resolution
+                        x0_switch_up = resize_latents_spatial(x0_switch, new_h, new_w, mode=res_upsample_mode)
+                        
+                        # Get noise for new resolution
+                        noise_new = resize_latents_spatial(noise_base, new_h, new_w, mode=res_upsample_mode)
+                        
+                        # Add noise at next timestep level
+                        ts_next = pipe.scheduler.timesteps[next_progress_id].to(device=pipe.device, dtype=pipe.torch_dtype)
+                        inputs_shared["latents"] = pipe.scheduler.add_noise(x0_switch_up, noise_new, ts_next)
+                        
+                        # Update current resolution tracking
+                        current_h, current_w = new_h, new_w
+                        noise_current = noise_new
+                        current_stage_idx = next_stage
+                        
+                        # Reset v_prev/vref_prev (shape changed)
+                        v_prev = None
+                        vref_prev = None
+            
             _perf_sample_end(perf, "hiflow_stage2_step", st)
+            
     finally:
         for key, prev in (("train_seq_len", prev_train_seq_len),
                         ("ntk_factor_h", prev_ntk_h),
@@ -258,4 +403,11 @@ def _run_denoise_hiflow(
                 inputs_shared.pop(key, None)
             else:
                 inputs_shared[key] = prev
+    
+    # If we ended at a lower resolution, upsample final result to target
+    if current_h != high_latent_h or current_w != high_latent_w:
+        inputs_shared["latents"] = resize_latents_spatial(
+            inputs_shared["latents"], high_latent_h, high_latent_w, mode=res_upsample_mode
+        )
+    
     return inputs_shared["latents"]

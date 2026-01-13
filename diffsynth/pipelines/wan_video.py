@@ -343,6 +343,17 @@ class WanVideoPipeline(BasePipeline):
         # Profiling (timings + sampled step timings)
         profile_timings: bool = False,
         profile_sample_every: int = 0,
+        # ========== HiFlow Stage2 Acceleration (NEW) ==========
+        # Dynamic Frame Rate: sparse temporal sampling for faster inference
+        hiflow_enable_dynamic_framerate: bool = False,
+        hiflow_framerate_schedule: Optional[str] = None,  # e.g. "0-15:3,16-49:1"
+        hiflow_framerate_interpolation_mode: str = "trilinear",
+        hiflow_framerate_keep_boundary: bool = True,
+        # Dynamic Resolution: progressive resolution scaling
+        hiflow_enable_dynamic_res: bool = False,
+        hiflow_res_rate_list: Optional[list] = None,  # e.g. [0.5, 0.75, 1.0]
+        hiflow_res_step_list: Optional[list] = None,  # e.g. [0, 12, 24] (relative to tau_index)
+        hiflow_res_upsample_mode: str = "bilinear",
     ):
         perf = _Perf(profile_timings)
         self.last_timings = None
@@ -504,6 +515,16 @@ class WanVideoPipeline(BasePipeline):
                     ntk_factor_w=ntk_factor_w,
                     perf=perf,
                     profile_sample_every=profile_sample_every,
+                    # Dynamic Frame Rate
+                    enable_dynamic_framerate=hiflow_enable_dynamic_framerate,
+                    framerate_schedule=hiflow_framerate_schedule,
+                    framerate_interpolation_mode=hiflow_framerate_interpolation_mode,
+                    framerate_keep_boundary=hiflow_framerate_keep_boundary,
+                    # Dynamic Resolution
+                    enable_dynamic_res=hiflow_enable_dynamic_res,
+                    res_rate_list=hiflow_res_rate_list,
+                    res_step_list=hiflow_res_step_list,
+                    res_upsample_mode=hiflow_res_upsample_mode,
                 )
         
         # VACE (TODO: remove it)

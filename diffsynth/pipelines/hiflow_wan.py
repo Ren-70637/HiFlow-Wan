@@ -1,4 +1,5 @@
 import torch
+import time
 from typing import Dict, List, Optional, Tuple
 
 from ..diffusion.hiflow_utils import (
@@ -22,6 +23,38 @@ def _maybe_switch_dit(pipe, models: Dict, timestep_tensor_1d: torch.Tensor, swit
         models["dit"] = pipe.dit2
         models["vace"] = pipe.vace2
     return models
+
+
+def _perf_sample_begin(enable: bool):
+    if not enable:
+        return None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+    else:
+        e0 = e1 = None
+    t0 = time.perf_counter()
+    return (t0, e0, e1)
+
+
+def _perf_sample_end(perf, key: str, state):
+    if state is None:
+        return
+    t0, e0, e1 = state
+    wall_ms = (time.perf_counter() - t0) * 1000.0
+    cuda_ms = None
+    if e0 is not None:
+        e1.record()
+        torch.cuda.synchronize()
+        cuda_ms = float(e0.elapsed_time(e1))
+    if perf is None:
+        return
+    add = getattr(perf, "add_sample", None)
+    if callable(add):
+        add(key, wall_ms=wall_ms, cuda_ms=cuda_ms)
+
 
 @torch.no_grad()
 def _cfg_guided_v(
@@ -62,6 +95,9 @@ def _run_denoise_record_x0(
     switch_DiT_boundary: float,
     progress_bar_cmd,
     store_on_cpu: bool = True,
+    # profiling
+    perf=None,
+    profile_sample_every: int = 0,
 ) -> List[torch.Tensor]:
     """
     返回：x0_low_pred_list[i]，长度 = num_inference_steps（与 scheduler.timesteps 对齐）
@@ -71,6 +107,8 @@ def _run_denoise_record_x0(
 
     # 确保 scheduler 已经在外部 set_timesteps 过（wan_video.py 本来就会做）
     for progress_id, ts_cpu in enumerate(progress_bar_cmd(pipe.scheduler.timesteps)):
+        sample_on = bool(profile_sample_every and profile_sample_every > 0 and (progress_id % int(profile_sample_every) == 0))
+        st = _perf_sample_begin(sample_on)
         # Switch DiT if necessary（保持一致）
         models = _maybe_switch_dit(pipe, models, ts_cpu, switch_DiT_boundary)
 
@@ -101,6 +139,8 @@ def _run_denoise_record_x0(
         if "first_frame_latents" in inputs_shared:
             inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
 
+        _perf_sample_end(perf, "hiflow_stage1_step", st)
+
     return x0_list
 
 
@@ -130,6 +170,9 @@ def _run_denoise_hiflow(
     ntk_factor_h: float = 1.0,
     ntk_factor_w: float = 1.0,
     train_seq_len: Optional[int] = None,
+    # profiling
+    perf=None,
+    profile_sample_every: int = 0,
 ) -> torch.Tensor:
     """
     返回 high-res 最终 latents: [B,C,T,Hhigh,Whigh]
@@ -174,6 +217,8 @@ def _run_denoise_hiflow(
     # 从 tau_index 开始积分到末尾
     try:
         for progress_id in range(tau_index, N):
+            sample_on = bool(profile_sample_every and profile_sample_every > 0 and (((progress_id - tau_index) % int(profile_sample_every)) == 0))
+            st = _perf_sample_begin(sample_on)
             ts_cpu = pipe.scheduler.timesteps[progress_id]
             models = _maybe_switch_dit(pipe, models, ts_cpu, switch_DiT_boundary)
             timestep = ts_cpu.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
@@ -204,6 +249,7 @@ def _run_denoise_hiflow(
             inputs_shared["latents"] = pipe.scheduler.step(v, ts_cpu, x)
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+            _perf_sample_end(perf, "hiflow_stage2_step", st)
     finally:
         for key, prev in (("train_seq_len", prev_train_seq_len),
                         ("ntk_factor_h", prev_ntk_h),

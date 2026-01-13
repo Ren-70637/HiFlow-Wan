@@ -1,4 +1,6 @@
 import torch, types
+import time
+import math
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -33,6 +35,76 @@ from ..models.wan_video_animate_adapter import WanAnimateAdapter
 from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
+
+
+class _PerfSection:
+    def __init__(self, perf, name: str, cuda: bool = True):
+        self.perf = perf
+        self.name = name
+        self.cuda = bool(cuda) and torch.cuda.is_available()
+
+    def __enter__(self):
+        if not self.perf.enable:
+            return self
+        if self.cuda:
+            torch.cuda.synchronize()
+            self.e0 = torch.cuda.Event(enable_timing=True)
+            self.e1 = torch.cuda.Event(enable_timing=True)
+            self.e0.record()
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.perf.enable:
+            return
+        wall_s = time.perf_counter() - self.t0
+        if self.cuda:
+            self.e1.record()
+            torch.cuda.synchronize()
+            cuda_ms = float(self.e0.elapsed_time(self.e1))
+        else:
+            cuda_ms = None
+        self.perf.sections[self.name] = {"wall_s": wall_s, "cuda_ms": cuda_ms}
+
+
+class _Perf:
+    def __init__(self, enable: bool):
+        self.enable = bool(enable)
+        self.sections = {}  # name -> {wall_s, cuda_ms}
+        self.samples = {}   # key -> {"wall_ms": [...], "cuda_ms": [...]}
+
+    def section(self, name: str, cuda: bool = True):
+        return _PerfSection(self, name=name, cuda=cuda)
+
+    def add_sample(self, key: str, wall_ms: float, cuda_ms: Optional[float]):
+        if not self.enable:
+            return
+        d = self.samples.setdefault(key, {"wall_ms": [], "cuda_ms": []})
+        d["wall_ms"].append(float(wall_ms))
+        if cuda_ms is not None:
+            d["cuda_ms"].append(float(cuda_ms))
+
+    @staticmethod
+    def _stats(values_ms):
+        if not values_ms:
+            return None
+        vs = sorted(float(x) for x in values_ms)
+        n = len(vs)
+        p50 = vs[n // 2]
+        p90 = vs[int(math.floor(0.9 * (n - 1)))]
+        mean = sum(vs) / n
+        return {"n": n, "mean_ms": mean, "p50_ms": p50, "p90_ms": p90, "max_ms": max(vs)}
+
+    def summary(self):
+        if not self.enable:
+            return None
+        sample_stats = {}
+        for k, v in self.samples.items():
+            sample_stats[k] = {
+                "wall_ms": self._stats(v.get("wall_ms", [])),
+                "cuda_ms": self._stats(v.get("cuda_ms", [])),
+            }
+        return {"sections": self.sections, "samples": sample_stats}
 
 
 class WanVideoPipeline(BasePipeline):
@@ -268,9 +340,16 @@ class WanVideoPipeline(BasePipeline):
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Optional[Literal["quantized", "floatpoint"]] = "quantized",
+        # Profiling (timings + sampled step timings)
+        profile_timings: bool = False,
+        profile_sample_every: int = 0,
     ):
+        perf = _Perf(profile_timings)
+        self.last_timings = None
+
         # Scheduler
-        self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
+        with perf.section("00_set_timesteps", cuda=False):
+            self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
         # Inputs
         inputs_posi = {
@@ -312,8 +391,9 @@ class WanVideoPipeline(BasePipeline):
             "ntk_factor_h": ntk_factor_h,
             "ntk_factor_w": ntk_factor_w,
         }
-        for unit in self.units:
-            inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        with perf.section("01_units_total", cuda=True):
+            for unit in self.units:
+                inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
@@ -332,31 +412,32 @@ class WanVideoPipeline(BasePipeline):
         # latent 尺寸严格按你工程：height // vae.upsampling_factor
         if (not use_hiflow) or target_height <= 0 or target_width <= 0:
             target_height, target_width = height, width
-            for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
-                # Switch DiT if necessary
-                if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and not models["dit"] is self.dit2:
-                    self.load_models_to_device(self.in_iteration_models_2)
-                    models["dit"] = self.dit2
-                    models["vace"] = self.vace2
+            with perf.section("02_denoise_normal_total", cuda=True):
+                for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+                    # Switch DiT if necessary
+                    if timestep.item() < switch_DiT_boundary * 1000 and self.dit2 is not None and not models["dit"] is self.dit2:
+                        self.load_models_to_device(self.in_iteration_models_2)
+                        models["dit"] = self.dit2
+                        models["vace"] = self.vace2
+                        
+                    # Timestep
+                    timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
                     
-                # Timestep
-                timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-                
-                # Inference
-                noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
-                if cfg_scale != 1.0:
-                    if cfg_merge:
-                        noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
+                    # Inference
+                    noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+                    if cfg_scale != 1.0:
+                        if cfg_merge:
+                            noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
+                        else:
+                            noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                        noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
                     else:
-                        noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
-                    noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
-                else:
-                    noise_pred = noise_pred_posi
+                        noise_pred = noise_pred_posi
 
-                # Scheduler
-                inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-                if "first_frame_latents" in inputs_shared:
-                    inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+                    # Scheduler
+                    inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
+                    if "first_frame_latents" in inputs_shared:
+                        inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
         else:
             # ===== HiFlow 路径 =====
             # # ===== 1) 准备 low-res latents，并跑 low-res 记录 x0_low_list =====
@@ -388,37 +469,42 @@ class WanVideoPipeline(BasePipeline):
                 device=self.device, dtype=self.torch_dtype
             )
 
-            x0_low_list = _run_denoise_record_x0(
-                self, models,
-                low_inputs_shared, inputs_posi, inputs_nega,
-                cfg_scale=cfg_scale,
-                cfg_merge=cfg_merge,
-                switch_DiT_boundary=switch_DiT_boundary,
-                progress_bar_cmd=progress_bar_cmd,
-                store_on_cpu=True,
-            )
+            with perf.section("02a_hiflow_stage1_record_x0_total", cuda=True):
+                x0_low_list = _run_denoise_record_x0(
+                    self, models,
+                    low_inputs_shared, inputs_posi, inputs_nega,
+                    cfg_scale=cfg_scale,
+                    cfg_merge=cfg_merge,
+                    switch_DiT_boundary=switch_DiT_boundary,
+                    progress_bar_cmd=progress_bar_cmd,
+                    store_on_cpu=True,
+                    perf=perf,
+                    profile_sample_every=profile_sample_every,
+                )
 
             # --- Stage 2: high-res HiFlow ---
-            inputs_shared["latents"] = _run_denoise_hiflow(
-            self, models,
-            inputs_shared, inputs_posi, inputs_nega,
-            x0_low_list=x0_low_list,
-            high_latent_h=high_lat_h,
-            high_latent_w=high_lat_w,
-            tau_ratio=hiflow_tau_ratio,
-            cfg_scale=cfg_scale,
-            cfg_merge=cfg_merge,
-            switch_DiT_boundary=switch_DiT_boundary,
-            progress_bar_cmd=progress_bar_cmd,
-            alpha=hiflow_alpha,
-            beta=hiflow_beta,
-            lp_cutoff=hiflow_lp_cutoff,
-            lp_order=hiflow_lp_order,
-            train_seq_len=train_seq_len_base,
-            # 若需要可控 ntk，可加：
-            # ntk_factor_h=ntk_factor_h,
-            # ntk_factor_w=ntk_factor_w,
-        )
+            with perf.section("02b_hiflow_stage2_highres_total", cuda=True):
+                inputs_shared["latents"] = _run_denoise_hiflow(
+                    self, models,
+                    inputs_shared, inputs_posi, inputs_nega,
+                    x0_low_list=x0_low_list,
+                    high_latent_h=high_lat_h,
+                    high_latent_w=high_lat_w,
+                    tau_ratio=hiflow_tau_ratio,
+                    cfg_scale=cfg_scale,
+                    cfg_merge=cfg_merge,
+                    switch_DiT_boundary=switch_DiT_boundary,
+                    progress_bar_cmd=progress_bar_cmd,
+                    alpha=hiflow_alpha,
+                    beta=hiflow_beta,
+                    lp_cutoff=hiflow_lp_cutoff,
+                    lp_order=hiflow_lp_order,
+                    train_seq_len=train_seq_len_base,
+                    ntk_factor_h=ntk_factor_h,
+                    ntk_factor_w=ntk_factor_w,
+                    perf=perf,
+                    profile_sample_every=profile_sample_every,
+                )
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
@@ -428,16 +514,20 @@ class WanVideoPipeline(BasePipeline):
                 f = 1
             inputs_shared["latents"] = inputs_shared["latents"][:, :, f:]
         # post-denoising, pre-decoding processing logic
-        for unit in self.post_units:
-            inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        with perf.section("03_post_units_total", cuda=True):
+            for unit in self.post_units:
+                inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
         # Decode
-        self.load_models_to_device(['vae'])
-        video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        if output_type == "quantized":
-            video = self.vae_output_to_video(video)
-        elif output_type == "floatpoint":
-            pass
+        with perf.section("04_vae_decode", cuda=True):
+            self.load_models_to_device(['vae'])
+            video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        with perf.section("05_output_convert", cuda=False):
+            if output_type == "quantized":
+                video = self.vae_output_to_video(video)
+            elif output_type == "floatpoint":
+                pass
         self.load_models_to_device([])
+        self.last_timings = perf.summary()
         return video
 
 

@@ -1,8 +1,8 @@
 '''
-HiFlow 高分辨率视频生成 + 动态帧率/动态分辨率加速示例
-1. 动态帧率（Dynamic Frame Rate）：早期步骤使用稀疏帧采样
-2. 动态分辨率（Dynamic Resolution）：逐步提升空间分辨率
-注意：这些加速功能默认关闭，可以根据需要启用
+HiFlow 高分辨率视频生成 + 仅动态帧率加速示例
+1. 动态帧率（Dynamic Frame Rate）：在 Stage2 早期步骤使用稀疏帧采样
+2. 不启用动态分辨率（Dynamic Resolution）
+注意：该脚本保持最终输出帧数为 81（4n+1），满足 Wan 默认设置
 '''
 
 import os
@@ -12,6 +12,7 @@ from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion.base_pipeline import PipelineUnit
 
+
 class HiFlowConfigUnit(PipelineUnit):
     def __init__(self, **cfg):
         super().__init__(input_params=())
@@ -20,12 +21,13 @@ class HiFlowConfigUnit(PipelineUnit):
     def process(self, pipe, **kwargs):
         return dict(self.cfg)
 
+
 # ============ 配置 ============
 BASE = os.environ.get("DIFFSYNTH_MODEL_BASE_PATH", "/home/rentianhao-20251020/data2/hiflow/checkpoints")
 
 # 14B DiT 是分片权重（6 个 safetensors），必须传入"文件列表"
 dit_paths = sorted(glob.glob(f"{BASE}/Wan-AI/Wan2.1-T2V-14B/diffusion_pytorch_model-*-of-*.safetensors"))
-print(f"[HiFlow_Wan_14b_accelerated] Found {len(dit_paths)} DiT shards under: {BASE}/Wan-AI/Wan2.1-T2V-14B/")
+print(f"[HiFlow_Wan_14b_framerate] Found {len(dit_paths)} DiT shards under: {BASE}/Wan-AI/Wan2.1-T2V-14B/")
 for p in dit_paths:
     print(f"  - {p}")
 assert len(dit_paths) == 6, (
@@ -48,7 +50,7 @@ pipe = WanVideoPipeline.from_pretrained(
 # ============ 分辨率设置 ============
 low_w, low_h = 1280, 720      # 低分辨率先验（720p）
 high_w, high_h = 2080, 1200   # 目标高分辨率
-num_frames = 33
+num_frames = 81               # 必须满足 4n+1
 num_inference_steps = 50
 
 # 计算训练基准 token 序列长度
@@ -77,20 +79,17 @@ pipe.units.insert(0, HiFlowConfigUnit(
     ntk_factor_w=ntk_factor,
 ))
 
-# ============ 加速配置 ============
-# 动态帧率配置
-# 格式："start-end:stride,..." 
+# ============ 加速配置（仅动态帧率） ============
+# 格式："start-end:stride,..."
 # stride=1 表示全帧，stride=3 表示每3帧采样一次
-# 示例："0-22:3,23-49:1" 表示前22步用稀疏帧，后面用全帧
-ENABLE_DYNAMIC_FRAMERATE = False
-FRAMERATE_SCHEDULE = "0-22:3,23-49:1"  # 根据 tau_ratio=0.25，Stage2 从约第12步开始
+# 说明：tau_ratio=0.25 => tau_index=12（Stage2 从 12 开始）
+ENABLE_DYNAMIC_FRAMERATE = True
+FRAMERATE_SCHEDULE = "12-35:3,36-49:1"  # Stage2 前 24 步稀疏，后 14 步全帧
 
-# 动态分辨率配置
-# res_rate_list: 每个阶段的分辨率比例（相对最终高分辨率）
-# res_step_list: 每个阶段开始的步数（相对 tau_index）
-ENABLE_DYNAMIC_RES = True
-RES_RATE_LIST = [0.5, 0.75, 1.0]  # 50% -> 75% -> 100%
-RES_STEP_LIST = [0, 12, 24]       # 相对 tau_index 的步数
+# 动态分辨率禁用
+ENABLE_DYNAMIC_RES = False
+RES_RATE_LIST = None
+RES_STEP_LIST = None
 
 # ============ 生成 ============
 video = pipe(
@@ -117,14 +116,13 @@ video = pipe(
     hiflow_framerate_schedule=FRAMERATE_SCHEDULE,
     hiflow_framerate_interpolation_mode="trilinear",
     hiflow_framerate_keep_boundary=True,
-    # ==== 动态分辨率加速 ====
+    # ==== 动态分辨率加速（禁用） ====
     hiflow_enable_dynamic_res=ENABLE_DYNAMIC_RES,
     hiflow_res_rate_list=RES_RATE_LIST,
     hiflow_res_step_list=RES_STEP_LIST,
-    hiflow_res_upsample_mode="bilinear",
 )
 
-save_video(video, "video_14b_2080x1200_accelerated.mp4", fps=15, quality=5)
+save_video(video, "video_14b_2080x1200_framerate.mp4", fps=15, quality=5)
 
 print("==== pipe.last_timings ====")
 print(pipe.last_timings)
@@ -134,6 +132,3 @@ print(f"动态帧率: {'启用' if ENABLE_DYNAMIC_FRAMERATE else '关闭'}")
 if ENABLE_DYNAMIC_FRAMERATE:
     print(f"  - 调度: {FRAMERATE_SCHEDULE}")
 print(f"动态分辨率: {'启用' if ENABLE_DYNAMIC_RES else '关闭'}")
-if ENABLE_DYNAMIC_RES:
-    print(f"  - 分辨率比例: {RES_RATE_LIST}")
-    print(f"  - 切换步数: {RES_STEP_LIST}")

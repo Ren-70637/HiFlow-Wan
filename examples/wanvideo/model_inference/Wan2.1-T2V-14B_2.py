@@ -36,10 +36,10 @@ pipe = WanVideoPipeline.from_pretrained(
 video = pipe(
     prompt="纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地上迅速奔跑。阳光洒在它身上，毛发柔软而闪亮。背景是开阔草地和蓝天白云，中景侧面移动视角。",
     negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-    height=1088,
-    width=1920,
+    height=2176,
+    width=3840,
     num_frames=33,
     seed=0,
     tiled=True,
 )
-save_video(video, "video_Wan2.1-T2V-14B_1920x1088_33f.mp4", fps=15, quality=5)
+save_video(video, "video_Wan2.1-T2V-14B_3840x2176_33f.mp4", fps=15, quality=5)

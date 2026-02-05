@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+<<<<<<< HEAD
 # ====== Git Push 脚本：服务器项目同步到自己的 GitHub ======
 REPO_DIR="/home/rentianhao-20251020/DiffSynth-Studio"
 REMOTE_NAME="mygithub"
 REMOTE_URL="git@github.com:Ren-70637/HiFlow-Wan.git"
 COMMIT_MSG="${1:-Update: sync changes ($(date +'%Y-%m-%d %H:%M:%S'))}"
+=======
+# ====== 配置区域 ======
+# 1. 你服务器上的本地项目路径
+REPO_DIR="/mnt/users/rentianhao-20251020/projects/DiffSynth-Studio"
+
+# 2. 你的 GitHub 仓库 SSH 地址
+# (注意：根据你的描述，本地文件夹是 DiffSynth-Studio，但你要推送到 HiFlow-Wan 仓库)
+MY_GITHUB_SSH="git@github.com:Ren-70637/HiFlow-Wan.git"
+# ====================
+
+# 检查目录是否存在
+if [ ! -d "$REPO_DIR" ]; then
+    echo "Error: 找不到目录 $REPO_DIR"
+    exit 1
+fi
+>>>>>>> 433fc2c (Update: sync latest changes from server)
 
 cd "$REPO_DIR" || exit 1
 

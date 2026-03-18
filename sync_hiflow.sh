@@ -1,68 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-<<<<<<< HEAD
-# ====== Git Push 脚本：服务器项目同步到自己的 GitHub ======
-REPO_DIR="/home/rentianhao-20251020/DiffSynth-Studio"
-REMOTE_NAME="mygithub"
-REMOTE_URL="git@github.com:Ren-70637/HiFlow-Wan.git"
-COMMIT_MSG="${1:-Update: sync changes ($(date +'%Y-%m-%d %H:%M:%S'))}"
-=======
-# ====== 配置区域 ======
-# 1. 你服务器上的本地项目路径
-REPO_DIR="/mnt/users/rentianhao-20251020/projects/DiffSynth-Studio"
+REMOTE="${REMOTE:-origin}"
+TARGET_BRANCH="${2:-${TARGET_BRANCH:-}}"
+COMMIT_MESSAGE="${1:-}"
 
-# 2. 你的 GitHub 仓库 SSH 地址
-# (注意：根据你的描述，本地文件夹是 DiffSynth-Studio，但你要推送到 HiFlow-Wan 仓库)
-MY_GITHUB_SSH="git@github.com:Ren-70637/HiFlow-Wan.git"
-# ====================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+CURRENT_REMOTE_URL="$(git -C "$REPO_ROOT" remote get-url "$REMOTE")"
+CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 
-# 检查目录是否存在
-if [ ! -d "$REPO_DIR" ]; then
-    echo "Error: 找不到目录 $REPO_DIR"
-    exit 1
+if [[ -z "$CURRENT_BRANCH" ]]; then
+  echo "Error: failed to detect the current branch." >&2
+  exit 1
 fi
->>>>>>> 433fc2c (Update: sync latest changes from server)
 
-cd "$REPO_DIR" || exit 1
-
-echo "== [1] Repo info =="
-git rev-parse --is-inside-work-tree >/dev/null
-BRANCH="$(git branch --show-current || true)"
-if [[ -z "$BRANCH" ]]; then
-  echo "ERROR: Detached HEAD（当前不在任何分支）"
-  echo "Fix: git switch -c <new-branch>"
-  exit 2
+if [[ -z "$TARGET_BRANCH" ]]; then
+  TARGET_BRANCH="$CURRENT_BRANCH"
 fi
-echo "Current branch: $BRANCH"
-git remote -v
-git status -sb
 
-echo "== [2] Fetch remotes =="
-git fetch --all --prune || true
+if [[ -z "$COMMIT_MESSAGE" ]]; then
+  COMMIT_MESSAGE="sync: update HiFlow-Wan on $(date '+%Y-%m-%d %H:%M:%S %Z')"
+fi
 
-echo "== [3] What changed? =="
-git diff --name-status || true
-git diff --stat || true
-git log --oneline --decorate --graph --max-count=20
+if [[ "$CURRENT_REMOTE_URL" =~ ^https://github\.com/([^/]+)/([^/]+)\.git$ ]]; then
+  SSH_REMOTE_URL="git@github.com:${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.git"
+  echo "Remote $REMOTE is HTTPS. Switching to SSH:"
+  echo "  $CURRENT_REMOTE_URL"
+  echo "  -> $SSH_REMOTE_URL"
+  git -C "$REPO_ROOT" remote set-url "$REMOTE" "$SSH_REMOTE_URL"
+  CURRENT_REMOTE_URL="$SSH_REMOTE_URL"
+fi
 
-echo "== [4] Commit local changes (if any) =="
-git add -A
-if git diff --cached --quiet; then
-  echo "No changes to commit."
+echo "Repo           : $REPO_ROOT"
+echo "Remote         : $REMOTE"
+echo "URL            : $CURRENT_REMOTE_URL"
+echo "Current branch : $CURRENT_BRANCH"
+echo "Target branch  : $TARGET_BRANCH"
+echo "Message        : $COMMIT_MESSAGE"
+echo
+echo "Current status:"
+git -C "$REPO_ROOT" status --short
+echo
+
+git -C "$REPO_ROOT" add -A
+
+if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+  git -C "$REPO_ROOT" commit -m "$COMMIT_MESSAGE"
 else
-  git commit -m "$COMMIT_MSG"
+  echo "No staged changes to commit."
 fi
 
-echo "== [5] Ensure remote '$REMOTE_NAME' points to your GitHub =="
-if git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
-  git remote set-url "$REMOTE_NAME" "$REMOTE_URL"
+echo
+echo "Current HEAD: $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+
+if [[ "$CURRENT_BRANCH" == "$TARGET_BRANCH" ]]; then
+  PUSH_REF="$TARGET_BRANCH"
 else
-  git remote add "$REMOTE_NAME" "$REMOTE_URL"
+  PUSH_REF="HEAD:$TARGET_BRANCH"
 fi
-git remote -v
 
-echo "== [6] Push =="
-git push -u "$REMOTE_NAME" "$BRANCH"
-
-echo "DONE: pushed $BRANCH to $REMOTE_NAME ($REMOTE_URL)"
+if git -C "$REPO_ROOT" push "$REMOTE" "$PUSH_REF"; then
+  echo
+  echo "Push completed: $REMOTE/$TARGET_BRANCH"
+else
+  echo
+  echo "Push failed."
+  echo "The local commit is preserved. Check GitHub authentication for remote $REMOTE."
+  echo "Current HEAD: $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  exit 1
+fi
